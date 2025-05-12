@@ -1,0 +1,1585 @@
+"""
+Explorador Interactivo de Repositorios
+======================================================
+Este script permite conectarse a repositorios de Bitbucket/GitHub, 
+explorar interactivamente su estructura de carpetas y descargar
+el contenido de la ruta seleccionada, incluyendo detección avanzada
+de archivos de código.
+"""
+
+import os
+import sys
+import time
+import logging
+import json
+import requests
+import getpass
+import tempfile
+import shutil
+import asyncio
+from typing import List, Dict, Any, Optional, Tuple, Union
+from pathlib import Path
+import base64
+
+# Configuración de logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("repo_explorer.log")
+    ]
+)
+logger = logging.getLogger("RepoExplorer")
+
+# Constantes
+TEMP_DIR = Path(tempfile.mkdtemp())
+OUTPUT_DIR = Path("./archivos_descargados")
+CONFIG_FILE = Path("./config.json")
+
+
+def secure_input(prompt="Contraseña: "):
+    """Alternativa a getpass que siempre usa input para entornos donde getpass no funciona."""
+    print("⚠️ NOTA: Su entrada será visible. Tenga cuidado en entornos compartidos.")
+    return input(f"{prompt} (visible) ")
+
+
+class ConfigManager:
+    """Gestiona la configuración de la aplicación."""
+    
+    @staticmethod
+    def load_config() -> Dict:
+        """Carga la configuración desde el archivo config.json."""
+        if CONFIG_FILE.exists():
+            try:
+                with open(CONFIG_FILE, "r") as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.error(f"Error al cargar el archivo de configuración: {e}")
+                return {}
+        return {}
+    
+    @staticmethod
+    def save_config(config: Dict) -> None:
+        """Guarda la configuración en el archivo config.json."""
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(config, f, indent=4)
+    
+    @staticmethod
+    def get_credentials(repo_type: str) -> Dict:
+        """Solicita las credenciales para el tipo de repositorio sin almacenamiento persistente."""
+        credentials = {}
+        
+        if repo_type == "bitbucket":
+            print("\nIngrese sus credenciales de Bitbucket (no se guardarán):")
+            credentials["username"] = input("Usuario de Bitbucket: ")
+            credentials["password"] = secure_input("Contraseña/Token de Bitbucket: ")
+            credentials["workspace"] = input("Workspace de Bitbucket: ")
+        elif repo_type == "github":
+            print("\nIngrese sus credenciales de GitHub (no se guardarán):")
+            credentials["token"] = secure_input("Token de GitHub: ")
+            credentials["owner"] = input("Propietario/Organización de GitHub: ")
+        
+        # No se guardan las credenciales, son solo de memoria temporal
+        return credentials
+
+
+class RepositoryManager:
+    """Gestiona las operaciones con repositorios (Bitbucket, GitHub)."""
+    
+    def __init__(self, repo_type: str):
+        self.repo_type = repo_type
+        self.credentials = ConfigManager.get_credentials(repo_type)
+        self.base_url = self._get_base_url()
+        self.session = requests.Session()
+        self._setup_auth()
+    
+    def _get_base_url(self) -> str:
+        """Devuelve la URL base para las API de los repositorios."""
+        if self.repo_type == "bitbucket":
+            return "https://api.bitbucket.org/2.0"
+        elif self.repo_type == "github":
+            return "https://api.github.com"
+        else:
+            raise ValueError(f"Tipo de repositorio no soportado: {self.repo_type}")
+    
+    def _setup_auth(self) -> None:
+        """Configura la autenticación para las solicitudes API."""
+        if self.repo_type == "bitbucket":
+            auth = (self.credentials["username"], self.credentials["password"])
+            self.session.auth = auth
+        elif self.repo_type == "github":
+            self.session.headers.update({
+                "Authorization": f"token {self.credentials['token']}",
+                "Accept": "application/vnd.github.v3+json"
+            })
+    
+    def list_projects(self) -> List[Dict]:
+        """Lista todos los proyectos disponibles en el repositorio."""
+        projects = []
+        
+        try:
+            if self.repo_type == "bitbucket":
+                workspace = self.credentials["workspace"]
+                url = f"{self.base_url}/workspaces/{workspace}/projects"
+                response = self.session.get(url)
+                response.raise_for_status()
+                data = response.json()
+                
+                for project in data.get("values", []):
+                    projects.append({
+                        "key": project["key"],
+                        "name": project["name"],
+                        "description": project.get("description", "Sin descripción")
+                    })
+                    
+                # Manejar paginación
+                while "next" in data:
+                    response = self.session.get(data["next"])
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    for project in data.get("values", []):
+                        projects.append({
+                            "key": project["key"],
+                            "name": project["name"],
+                            "description": project.get("description", "Sin descripción")
+                        })
+                
+            elif self.repo_type == "github":
+                owner = self.credentials["owner"]
+                url = f"{self.base_url}/users/{owner}/repos"
+                response = self.session.get(url)
+                response.raise_for_status()
+                data = response.json()
+                
+                for repo in data:
+                    projects.append({
+                        "key": repo["name"],
+                        "name": repo["name"],
+                        "description": repo.get("description", "Sin descripción")
+                    })
+                
+                # Manejar paginación
+                while 'next' in response.links.keys():
+                    response = self.session.get(response.links['next']['url'])
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    for repo in data:
+                        projects.append({
+                            "key": repo["name"],
+                            "name": repo["name"],
+                            "description": repo.get("description", "Sin descripción")
+                        })
+                    
+        except requests.RequestException as e:
+            logger.error(f"Error al obtener los proyectos: {e}")
+            if hasattr(e, 'response') and hasattr(e.response, 'text'):
+                logger.error(f"Respuesta del servidor: {e.response.text}")
+            raise Exception(f"No se pudieron listar los proyectos: {str(e)}")
+            
+        return projects
+    
+    def list_repositories(self, project_key: str) -> List[Dict]:
+        """Lista todos los repositorios dentro de un proyecto."""
+        repos = []
+        
+        try:
+            if self.repo_type == "bitbucket":
+                workspace = self.credentials["workspace"]
+                url = f"{self.base_url}/repositories/{workspace}"
+                params = {"q": f"project.key=\"{project_key}\""}
+                response = self.session.get(url, params=params)
+                response.raise_for_status()
+                data = response.json()
+                
+                for repo in data.get("values", []):
+                    repos.append({
+                        "slug": repo["slug"],
+                        "name": repo["name"],
+                        "description": repo.get("description", "Sin descripción")
+                    })
+                    
+                # Manejar paginación
+                while "next" in data:
+                    response = self.session.get(data["next"])
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    for repo in data.get("values", []):
+                        repos.append({
+                            "slug": repo["slug"],
+                            "name": repo["name"],
+                            "description": repo.get("description", "Sin descripción")
+                        })
+                    
+            elif self.repo_type == "github":
+                # Para GitHub, ya tenemos la lista de repos
+                repos.append({
+                    "slug": project_key,
+                    "name": project_key,
+                    "description": "Repositorio GitHub"
+                })
+                
+        except requests.RequestException as e:
+            logger.error(f"Error al obtener los repositorios: {e}")
+            if hasattr(e, 'response') and hasattr(e.response, 'text'):
+                logger.error(f"Respuesta del servidor: {e.response.text}")
+            raise Exception(f"No se pudieron listar los repositorios: {str(e)}")
+            
+        return repos
+        
+    def list_branches(self, project_key: str, repo_slug: str) -> List[Dict]:
+        """Lista todas las ramas disponibles en un repositorio."""
+        branches = []
+        
+        try:
+            if self.repo_type == "bitbucket":
+                workspace = self.credentials["workspace"]
+                url = f"{self.base_url}/repositories/{workspace}/{repo_slug}/refs/branches"
+                response = self.session.get(url)
+                response.raise_for_status()
+                data = response.json()
+                
+                for branch in data.get("values", []):
+                    branches.append({
+                        "name": branch["name"],
+                        "is_default": branch.get("default", False)
+                    })
+                    
+                # Manejar paginación
+                while "next" in data:
+                    response = self.session.get(data["next"])
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    for branch in data.get("values", []):
+                        branches.append({
+                            "name": branch["name"],
+                            "is_default": branch.get("default", False)
+                        })
+            
+            elif self.repo_type == "github":
+                owner = self.credentials["owner"]
+                url = f"{self.base_url}/repos/{owner}/{repo_slug}/branches"
+                response = self.session.get(url)
+                response.raise_for_status()
+                data = response.json()
+                
+                # Obtener la rama predeterminada
+                default_branch_name = None
+                repo_info_url = f"{self.base_url}/repos/{owner}/{repo_slug}"
+                repo_info_response = self.session.get(repo_info_url)
+                if repo_info_response.status_code == 200:
+                    repo_info = repo_info_response.json()
+                    default_branch_name = repo_info.get("default_branch")
+                
+                for branch in data:
+                    branches.append({
+                        "name": branch["name"],
+                        "is_default": branch["name"] == default_branch_name
+                    })
+                
+                # Manejar paginación
+                while 'next' in response.links.keys():
+                    response = self.session.get(response.links['next']['url'])
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    for branch in data:
+                        branches.append({
+                            "name": branch["name"],
+                            "is_default": branch["name"] == default_branch_name
+                        })
+                
+        except requests.RequestException as e:
+            logger.error(f"Error al obtener las ramas: {e}")
+            if hasattr(e, 'response') and hasattr(e.response, 'text'):
+                logger.error(f"Respuesta del servidor: {e.response.text}")
+            
+            # Si falla, intentemos devolver al menos las ramas comunes
+            if not branches:
+                for common_branch in ["main", "master", "develop", "trunk"]:
+                    branches.append({
+                        "name": common_branch,
+                        "is_default": common_branch == "main" or common_branch == "master"
+                    })
+                logger.info("No se pudieron obtener las ramas, usando ramas comunes")
+        
+        return branches
+    
+    def _get_default_branch(self, project_key: str, repo_slug: str) -> str:
+        """Obtiene la rama predeterminada del repositorio."""
+        default_branch = None
+        
+        try:
+            if self.repo_type == "bitbucket":
+                workspace = self.credentials["workspace"]
+                
+                # Intentar con diferentes variantes de mayúsculas/minúsculas para el slug
+                repo_slug_variants = [repo_slug, repo_slug.lower(), repo_slug.upper(), repo_slug.capitalize()]
+                
+                for slug_variant in repo_slug_variants:
+                    # Método 1: Intentar obtener desde la información del repositorio
+                    repo_url = f"{self.base_url}/repositories/{workspace}/{slug_variant}"
+                    logger.info(f"Intentando obtener información del repositorio desde: {repo_url}")
+                    response = self.session.get(repo_url)
+                    
+                    if response.status_code == 200:
+                        repo_info = response.json()
+                        if "mainbranch" in repo_info and repo_info["mainbranch"]:
+                            default_branch = repo_info["mainbranch"]["name"]
+                            logger.info(f"Rama predeterminada obtenida desde mainbranch: {default_branch}")
+                            return default_branch
+                        break
+                
+                # Método 2: Obtener todas las ramas y buscar la predeterminada o seleccionar por prioridad
+                branches = self.list_branches(project_key, repo_slug)
+                
+                # Primero buscar una rama marcada como predeterminada
+                for branch in branches:
+                    if branch.get("is_default", False):
+                        default_branch = branch["name"]
+                        logger.info(f"Rama predeterminada obtenida desde is_default: {default_branch}")
+                        return default_branch
+                
+                # Si no hay una rama predeterminada, usar una de las comunes por prioridad
+                priority_branches = ["main", "master", "develop", "trunk", "release", "hotfix"]
+                branch_names = [b["name"] for b in branches]
+                
+                for priority in priority_branches:
+                    if priority in branch_names:
+                        default_branch = priority
+                        logger.info(f"Rama seleccionada por prioridad: {default_branch}")
+                        return default_branch
+                
+                # Si ninguna coincide con las prioritarias, usar la primera rama disponible
+                if branches:
+                    default_branch = branches[0]["name"]
+                    logger.info(f"Usando primera rama disponible: {default_branch}")
+                    return default_branch
+                
+                # Si aún no hay ramas, intentar algunas comunes
+                logger.warning("No se encontraron ramas. Intentando con ramas comunes.")
+                return "main"  # Intentar con 'main' como último recurso
+                
+            elif self.repo_type == "github":
+                owner = self.credentials["owner"]
+                
+                # Obtener la información del repositorio
+                repo_url = f"{self.base_url}/repos/{owner}/{repo_slug}"
+                response = self.session.get(repo_url)
+                
+                if response.status_code == 200:
+                    repo_info = response.json()
+                    default_branch = repo_info.get("default_branch")
+                    if default_branch:
+                        logger.info(f"Rama predeterminada de GitHub: {default_branch}")
+                        return default_branch
+                
+                # Si no se puede obtener, intentar con ramas comunes
+                logger.warning("No se pudo obtener la rama predeterminada de GitHub. Intentando con ramas comunes.")
+                return "main"  # Intentar con 'main' como último recurso
+                
+        except Exception as e:
+            logger.error(f"Error al obtener la rama predeterminada: {e}")
+            
+        # Si todo falla, devolver 'main' como valor predeterminado
+        logger.warning("Usando 'main' como rama predeterminada por defecto")
+        return "main"
+    
+    def get_folder_contents(self, project_key: str, repo_slug: str, path: str = "", branch: str = None) -> List[Dict]:
+        """Obtiene el contenido de una carpeta específica del repositorio."""
+        contents = []
+        
+        try:
+            # Si no se especifica rama, obtener la predeterminada
+            if not branch:
+                branch = self._get_default_branch(project_key, repo_slug)
+            
+            if self.repo_type == "bitbucket":
+                workspace = self.credentials["workspace"]
+                
+                # Modificación: Intentar con mayúsculas/minúsculas diferentes
+                repo_slug_variants = [repo_slug, repo_slug.lower(), repo_slug.upper(), repo_slug.capitalize()]
+                
+                success = False
+                for slug_variant in repo_slug_variants:
+                    # URL para obtener el contenido de la carpeta con diferentes variantes
+                    url = f"{self.base_url}/repositories/{workspace}/{slug_variant}/src/{branch}"
+                    if path:
+                        url = f"{url}/{path}"
+                    
+                    logger.info(f"Intentando acceder a: {url}")
+                    response = self.session.get(url)
+                    
+                    if response.status_code == 200:
+                        success = True
+                        data = response.json()
+                        
+                        # Procesar el contenido
+                        for item in data.get("values", []):
+                            item_type = "directory" if item.get("type") == "commit_directory" else "file"
+                            item_path = item.get("path", "")
+                            
+                            contents.append({
+                                "name": item_path.split("/")[-1] if "/" in item_path else item_path,
+                                "path": item_path,
+                                "type": item_type,
+                                "size": item.get("size", 0) if item_type == "file" else None
+                            })
+                        break
+                
+                if not success:
+                    # Intento alternativo: usar API de contenido mediante refs
+                    try:
+                        logger.info("Intentando método alternativo para obtener contenido...")
+                        
+                        # Intentar con diferentes variantes de mayúsculas/minúsculas
+                        for slug_variant in repo_slug_variants:
+                            refs_url = f"{self.base_url}/repositories/{workspace}/{slug_variant}/refs/branches/{branch}"
+                            logger.info(f"Probando refs URL: {refs_url}")
+                            refs_response = self.session.get(refs_url)
+                            
+                            if refs_response.status_code == 200:
+                                branch_data = refs_response.json()
+                                target_hash = branch_data.get("target", {}).get("hash")
+                                
+                                if target_hash:
+                                    commit_url = f"{self.base_url}/repositories/{workspace}/{slug_variant}/src/{target_hash}/"
+                                    if path:
+                                        commit_url = f"{commit_url}{path}"
+                                    
+                                    logger.info(f"Usando commit hash: {commit_url}")
+                                    commit_response = self.session.get(commit_url)
+                                    
+                                    if commit_response.status_code == 200:
+                                        commit_data = commit_response.json()
+                                        for item in commit_data.get("values", []):
+                                            item_type = "directory" if item.get("type") == "commit_directory" else "file"
+                                            item_path = item.get("path", "")
+                                            
+                                            contents.append({
+                                                "name": item_path.split("/")[-1] if "/" in item_path else item_path,
+                                                "path": item_path,
+                                                "type": item_type,
+                                                "size": item.get("size", 0) if item_type == "file" else None
+                                            })
+                                        success = True
+                                        break
+                            
+                            # Si éxito con esta variante, salir del bucle
+                            if success:
+                                break
+                        
+                        # ÚLTIMO RECURSO: Probar directamente con las APIs de navegación
+                        if not success:
+                            logger.info("Intentando acceso directo a navegación de repo...")
+                            
+                            # API de navegación (nuevo formato)
+                            browse_url = f"https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}/browse"
+                            if path:
+                                browse_url = f"{browse_url}/{path}"
+                            
+                            logger.info(f"Probando URL de navegación: {browse_url}")
+                            browse_response = self.session.get(browse_url)
+                            
+                            if browse_response.status_code == 200:
+                                try:
+                                    browse_data = browse_response.json()
+                                    for item in browse_data.get("values", []):
+                                        item_type = "directory" if item.get("type") == "commit_directory" else "file"
+                                        item_path = item.get("path", "")
+                                        
+                                        contents.append({
+                                            "name": item_path.split("/")[-1] if "/" in item_path else item_path,
+                                            "path": item_path,
+                                            "type": item_type,
+                                            "size": item.get("size", 0) if item_type == "file" else None
+                                        })
+                                except:
+                                    # Podría no ser JSON
+                                    pass
+                    except Exception as alt_error:
+                        logger.error(f"Error en método alternativo: {alt_error}")
+                    
+            elif self.repo_type == "github":
+                owner = self.credentials["owner"]
+                
+                # URL para obtener el contenido de la carpeta
+                url = f"{self.base_url}/repos/{owner}/{repo_slug}/contents"
+                if path:
+                    url = f"{url}/{path}"
+                url = f"{url}?ref={branch}"
+                
+                response = self.session.get(url)
+                response.raise_for_status()
+                data = response.json()
+                
+                # Asegurar que data sea una lista
+                if not isinstance(data, list):
+                    data = [data]
+                
+                # Procesar el contenido
+                for item in data:
+                    item_type = "directory" if item.get("type") == "dir" else "file"
+                    
+                    contents.append({
+                        "name": item.get("name", ""),
+                        "path": item.get("path", ""),
+                        "type": item_type,
+                        "size": item.get("size", 0) if item_type == "file" else None
+                    })
+            
+        except requests.RequestException as e:
+            logger.error(f"Error al obtener el contenido de la carpeta: {e}")
+            if hasattr(e, 'response') and hasattr(e.response, 'text'):
+                logger.error(f"Respuesta del servidor: {e.response.text}")
+            
+            # Si hay un error, intentar devolver algún contenido sugerido
+            if path == "":
+                # Para la raíz, sugerir algunas carpetas comunes
+                common_dirs = ["src", "lib", "app", "main", "docs", "tests", "IA", "proyectos", 
+                               "innovacion", "BI", "rag_sescol", "seleccion_personal"]
+                for dir_name in common_dirs:
+                    contents.append({
+                        "name": dir_name,
+                        "path": dir_name,
+                        "type": "directory",
+                        "size": None,
+                        "suggested": True  # Marcar como sugerido, no confirmado
+                    })
+                
+                logger.info("Error al obtener contenido real, usando carpetas sugeridas")
+                
+                # También agregar un mensaje informativo para el usuario
+                contents.append({
+                    "name": "MENSAJE_INFO.txt",
+                    "path": "MENSAJE_INFO.txt",
+                    "type": "file",
+                    "size": 100,
+                    "suggested": True,
+                    "info": "Este mensaje contiene información sobre el problema de acceso",
+                    "content": "No se pudo acceder al contenido real del repositorio. Esto puede deberse a permisos, "
+                               "problemas de conectividad o cambios en la estructura del repositorio. Las carpetas "
+                               "que ves son solo sugerencias comunes. Intenta seleccionar una de ellas y explorarla, "
+                               "o prueba con otra rama o repositorio."
+                })
+        
+        return contents
+    
+    def download_folder(self, project_key: str, repo_slug: str, path: str, target_dir: Path, branch: str = None) -> Path:
+        """Descarga una carpeta específica del repositorio."""
+        # Asegurar que el directorio de destino exista
+        download_dir = target_dir / path.replace("/", "_") if path else target_dir / repo_slug
+        download_dir.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            # Si no se especifica rama, obtener la predeterminada
+            if not branch:
+                branch = self._get_default_branch(project_key, repo_slug)
+            
+            logger.info(f"Descargando contenido de '{path or 'raíz'}' del repositorio {repo_slug} (rama: {branch})...")
+            
+            # Intentar métodos alternativos si el normal falla
+            success = False
+            
+            # Método 1: API estándar
+            try:
+                # Obtener el contenido de la carpeta
+                folder_contents = self.get_folder_contents(project_key, repo_slug, path, branch)
+                
+                if folder_contents and not all(item.get("suggested", False) for item in folder_contents):
+                    # Descargar cada elemento del contenido
+                    for item in folder_contents:
+                        if item.get("suggested", False):
+                            # Saltar elementos sugeridos (no son reales)
+                            continue
+                        
+                        item_path = item["path"]
+                        item_type = item["type"]
+                        
+                        if item_type == "directory":
+                            # Crear subdirectorio y descargar su contenido recursivamente
+                            subdir = download_dir / item["name"]
+                            subdir.mkdir(parents=True, exist_ok=True)
+                            
+                            # Llamada recursiva para descargar el contenido del subdirectorio
+                            self._download_folder_recursive(project_key, repo_slug, item_path, subdir, branch)
+                        else:
+                            # Descargar archivo individual
+                            self._download_file(project_key, repo_slug, item_path, download_dir, branch)
+                    
+                    success = True
+                else:
+                    logger.warning(f"Método estándar no encontró archivos reales. Intentando método alternativo...")
+            except Exception as e:
+                logger.error(f"Error en método estándar de descarga: {e}")
+            
+            # Método 2: Descargar directamente desde el navegador del repositorio
+            if not success:
+                try:
+                    logger.info("Intentando método alternativo con URL de navegación...")
+                    
+                    # Detectar si estamos usando Bitbucket o GitHub
+                    if self.repo_type == "bitbucket":
+                        workspace = self.credentials["workspace"]
+                        base_path = f"https://bitbucket.org/{workspace}/{repo_slug}/src/{branch}/"
+                        if path:
+                            base_path += f"{path}/"
+                            
+                        # Intentar extraer el listado de archivos desde la página HTML
+                        session = requests.Session()
+                        session.auth = self.session.auth
+                        headers = {
+                            "Accept": "text/html,application/xhtml+xml,application/xml",
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                        }
+                        
+                        response = session.get(base_path, headers=headers)
+                        if response.status_code == 200:
+                            html_content = response.text
+                            
+                            # Buscar enlaces a archivos (simplificado - no es un parser HTML completo)
+                            import re
+                            file_links = re.findall(r'href="[^"]*?/src/[^"]*?/([^"]+)"', html_content)
+                            
+                            file_count = 0
+                            for file_link in file_links:
+                                if "/" not in file_link and file_link != "..":  # Evitar subcarpetas y enlace de regreso
+                                    # Construir la ruta completa al archivo
+                                    file_path = f"{path}/{file_link}" if path else file_link
+                                    
+                                    # Descargar el archivo
+                                    try:
+                                        self._download_file(project_key, repo_slug, file_path, download_dir, branch)
+                                        file_count += 1
+                                    except Exception as file_e:
+                                        logger.error(f"Error al descargar {file_path}: {file_e}")
+                            
+                            if file_count > 0:
+                                logger.info(f"Método alternativo descargó {file_count} archivos")
+                                success = True
+                
+                except Exception as alt_e:
+                    logger.error(f"Error en método alternativo: {alt_e}")
+            
+            # Método 3: Buscar archivos con extensiones específicas
+            if not success:
+                try:
+                    logger.info("Buscando archivos con extensiones específicas...")
+                    code_extensions = [".py", ".java", ".js", ".ts", ".html", ".css", ".jsx", ".tsx", 
+                                     ".php", ".c", ".cpp", ".cs", ".go", ".rb", ".sh", ".sql", 
+                                     ".md", ".json", ".yml", ".yaml", ".xml", ".txt", ".docx", ".xlsx"]
+                    
+                    path_prefix = f"{path}/" if path else ""
+                    
+                    file_count = 0
+                    for ext in code_extensions:
+                        try:
+                            # Intentar buscar archivos con esta extensión
+                            file_path = f"{path_prefix}*{ext}"
+                            logger.info(f"Buscando archivos: {file_path}")
+                            
+                            # Para Bitbucket, construir una URL especial para buscar por extensión
+                            if self.repo_type == "bitbucket":
+                                workspace = self.credentials["workspace"]
+                                search_url = f"{self.base_url}/repositories/{workspace}/{repo_slug}/src/{branch}"
+                                params = {"q": f"path:*{ext}"}
+                                
+                                response = self.session.get(search_url, params=params)
+                                if response.status_code == 200:
+                                    try:
+                                        data = response.json()
+                                        
+                                        for item in data.get("values", []):
+                                            if item.get("type") != "commit_directory" and item.get("path", "").lower().endswith(ext):
+                                                item_path = item.get("path", "")
+                                                
+                                                # Comprobar si el archivo está en la carpeta solicitada
+                                                if not path or item_path.startswith(path_prefix):
+                                                    # Descargar el archivo
+                                                    try:
+                                                        file_name = item_path.split("/")[-1]
+                                                        file_url = f"{self.base_url}/repositories/{workspace}/{repo_slug}/src/{branch}/{item_path}"
+                                                        file_response = self.session.get(file_url)
+                                                        
+                                                        if file_response.status_code == 200:
+                                                            with open(download_dir / file_name, "wb") as f:
+                                                                f.write(file_response.content)
+                                                            
+                                                            logger.info(f"Archivo encontrado y descargado: {file_name}")
+                                                            file_count += 1
+                                                    except Exception as file_e:
+                                                        logger.error(f"Error descargando {item_path}: {file_e}")
+                                    except Exception as json_e:
+                                        logger.error(f"Error procesando respuesta JSON: {json_e}")
+                        except Exception as ext_e:
+                            logger.error(f"Error buscando archivos {ext}: {ext_e}")
+                    
+                    if file_count > 0:
+                        logger.info(f"Se encontraron y descargaron {file_count} archivos específicos")
+                        success = True
+                except Exception as search_e:
+                    logger.error(f"Error en búsqueda de archivos específicos: {search_e}")
+            
+            logger.info(f"Descarga completada en: {download_dir}")
+            return download_dir
+            
+        except Exception as e:
+            logger.error(f"Error al descargar la carpeta: {e}")
+            raise Exception(f"No se pudo descargar la carpeta: {str(e)}")
+    
+    def _download_folder_recursive(self, project_key: str, repo_slug: str, path: str, target_dir: Path, branch: str) -> None:
+        """Descarga recursivamente el contenido de una carpeta."""
+        try:
+            # Obtener el contenido de la carpeta
+            folder_contents = self.get_folder_contents(project_key, repo_slug, path, branch)
+            
+            if not folder_contents:
+                return
+            
+            # Descargar cada elemento del contenido
+            for item in folder_contents:
+                if item.get("suggested", False):
+                    continue
+                
+                item_path = item["path"]
+                item_type = item["type"]
+                
+                if item_type == "directory":
+                    # Crear subdirectorio y descargar su contenido recursivamente
+                    subdir = target_dir / item["name"]
+                    subdir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Llamada recursiva para descargar el contenido del subdirectorio
+                    self._download_folder_recursive(project_key, repo_slug, item_path, subdir, branch)
+                else:
+                    # Descargar archivo individual
+                    self._download_file(project_key, repo_slug, item_path, target_dir, branch)
+                    
+        except Exception as e:
+            logger.error(f"Error en descarga recursiva de {path}: {e}")
+    
+    def _download_file(self, project_key: str, repo_slug: str, file_path: str, target_dir: Path, branch: str) -> None:
+        """Descarga un archivo individual del repositorio."""
+        try:
+            # Determinar el nombre del archivo y la estructura de directorios
+            path_parts = file_path.split("/")
+            file_name = path_parts[-1]
+            
+            # Crear estructura de directorios si es necesario
+            if len(path_parts) > 1:
+                dir_path = target_dir / "/".join(path_parts[:-1])
+                dir_path.mkdir(parents=True, exist_ok=True)
+                output_path = dir_path / file_name
+            else:
+                output_path = target_dir / file_name
+            
+            if self.repo_type == "bitbucket":
+                workspace = self.credentials["workspace"]
+                
+                # Probar diferentes variantes del nombre del repositorio
+                repo_slug_variants = [repo_slug, repo_slug.lower(), repo_slug.upper(), repo_slug.capitalize()]
+                
+                success = False
+                for slug_variant in repo_slug_variants:
+                    file_url = f"{self.base_url}/repositories/{workspace}/{slug_variant}/src/{branch}/{file_path}"
+                    
+                    response = self.session.get(file_url)
+                    if response.status_code == 200:
+                        with open(output_path, "wb") as f:
+                            f.write(response.content)
+                        
+                        logger.info(f"Archivo descargado: {output_path}")
+                        success = True
+                        break
+                
+                # Si no se pudo descargar con el método normal, probar con un método alternativo
+                if not success:
+                    # Intentar método alternativo: usar API de contenido directo
+                    try:
+                        # Intentar método alternativo con la URL de navegación directa
+                        browse_url = f"https://bitbucket.org/{workspace}/{repo_slug}/raw/{branch}/{file_path}"
+                        
+                        headers = {
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                        }
+                        
+                        browse_session = requests.Session()
+                        browse_session.auth = self.session.auth
+                        
+                        browse_response = browse_session.get(browse_url, headers=headers)
+                        
+                        if browse_response.status_code == 200:
+                            with open(output_path, "wb") as f:
+                                f.write(browse_response.content)
+                            
+                            logger.info(f"Archivo descargado (método alternativo): {output_path}")
+                            success = True
+                    except Exception as alt_e:
+                        logger.error(f"Error en método alternativo para {file_path}: {alt_e}")
+                
+                if not success:
+                    logger.error(f"No se pudo descargar el archivo {file_path}")
+                
+            elif self.repo_type == "github":
+                owner = self.credentials["owner"]
+                file_url = f"{self.base_url}/repos/{owner}/{repo_slug}/contents/{file_path}?ref={branch}"
+                
+                response = self.session.get(file_url)
+                response.raise_for_status()
+                data = response.json()
+                
+                if "download_url" in data and data["download_url"]:
+                    # Descargar usando la URL directa
+                    download_response = self.session.get(data["download_url"])
+                    download_response.raise_for_status()
+                    
+                    with open(output_path, "wb") as f:
+                        f.write(download_response.content)
+                elif "content" in data and data["encoding"] == "base64":
+                    # Decodificar el contenido base64
+                    content = base64.b64decode(data["content"])
+                    
+                    with open(output_path, "wb") as f:
+                        f.write(content)
+                else:
+                    logger.error(f"No se pudo obtener el contenido del archivo: {file_path}")
+            
+            logger.info(f"Archivo descargado: {output_path}")
+            
+        except Exception as e:
+            logger.error(f"Error al descargar el archivo {file_path}: {e}")
+    
+    def get_specific_file_content(self, project_key: str, repo_slug: str, file_path: str, branch: str = None) -> Optional[bytes]:
+        """Obtiene el contenido de un archivo específico."""
+        try:
+            if not branch:
+                branch = self._get_default_branch(project_key, repo_slug)
+                
+            if self.repo_type == "bitbucket":
+                workspace = self.credentials["workspace"]
+                
+                # Probar diferentes variantes del nombre del repositorio
+                repo_slug_variants = [repo_slug, repo_slug.lower(), repo_slug.upper(), repo_slug.capitalize()]
+                
+                for slug_variant in repo_slug_variants:
+                    file_url = f"{self.base_url}/repositories/{workspace}/{slug_variant}/src/{branch}/{file_path}"
+                    logger.info(f"Accediendo a archivo específico: {file_url}")
+                    
+                    response = self.session.get(file_url)
+                    if response.status_code == 200:
+                        return response.content
+                
+                logger.warning(f"No se pudo acceder al archivo {file_path}")
+                return None
+            
+            elif self.repo_type == "github":
+                owner = self.credentials["owner"]
+                file_url = f"{self.base_url}/repos/{owner}/{repo_slug}/contents/{file_path}?ref={branch}"
+                
+                response = self.session.get(file_url)
+                if response.status_code == 200:
+                    data = response.json()
+                    
+                    if "download_url" in data and data["download_url"]:
+                        download_response = self.session.get(data["download_url"])
+                        if download_response.status_code == 200:
+                            return download_response.content
+                    elif "content" in data and data["encoding"] == "base64":
+                        return base64.b64decode(data["content"])
+                
+                logger.warning(f"No se pudo acceder al archivo {file_path}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error al obtener archivo específico: {e}")
+            return None
+
+
+class RepositoryExplorer:
+    """Interfaz interactiva para explorar y descargar contenido de repositorios."""
+    
+    def __init__(self):
+        self.repo_manager = None
+        self.project_key = None
+        self.repo_slug = None
+        self.current_branch = None
+        
+        # Crear directorio de salida si no existe
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    
+    async def run(self):
+        """Ejecuta el explorador interactivo."""
+        print("\n" + "=" * 80)
+        print("  🔍 EXPLORADOR INTERACTIVO DE REPOSITORIOS 🔍")
+        print("=" * 80 + "\n")
+        
+        # Seleccionar tipo de repositorio
+        await self._select_repository_type()
+        
+        # Seleccionar proyecto
+        if not await self._select_project():
+            return
+        
+        # Seleccionar repositorio
+        if not await self._select_repository():
+            return
+        
+        # Seleccionar rama
+        if not await self._select_branch():
+            return
+        
+        # Explorar el repositorio
+        await self._explore_repository()
+    
+    async def _select_repository_type(self):
+        """Guía al usuario para seleccionar el tipo de repositorio."""
+        print("\nSeleccione el tipo de repositorio:")
+        print("1. Bitbucket")
+        print("2. GitHub")
+        
+        while True:
+            option = input("\nSeleccione una opción: ")
+            
+            if option == "1":
+                repo_type = "bitbucket"
+                break
+            elif option == "2":
+                repo_type = "github"
+                break
+            else:
+                print("❌ Opción no válida, por favor intente de nuevo.")
+        
+        # Crear gestor de repositorio
+        self.repo_manager = RepositoryManager(repo_type)
+        print(f"\n✅ Conectado a {repo_type.capitalize()}")
+    
+    async def _select_project(self) -> bool:
+        """Guía al usuario para seleccionar un proyecto."""
+        try:
+            print("\nObteniendo proyectos disponibles...")
+            projects = self.repo_manager.list_projects()
+            
+            if not projects:
+                print("❌ No se encontraron proyectos disponibles.")
+                return False
+            
+            print("\nProyectos disponibles:")
+            for i, project in enumerate(projects):
+                print(f"{i+1}. {project['name']} - {project['description']}")
+            
+            while True:
+                try:
+                    project_idx = int(input("\nSeleccione un proyecto (número): ")) - 1
+                    if 0 <= project_idx < len(projects):
+                        self.project_key = projects[project_idx]['key']
+                        print(f"\n✅ Proyecto seleccionado: {projects[project_idx]['name']}")
+                        return True
+                    else:
+                        print("❌ Índice de proyecto no válido, por favor intente de nuevo.")
+                except ValueError:
+                    print("❌ Por favor ingrese un número válido.")
+            
+        except Exception as e:
+            logger.error(f"Error al seleccionar proyecto: {e}")
+            print(f"\n❌ Error: {str(e)}")
+            return False
+    
+    async def _select_repository(self) -> bool:
+        """Guía al usuario para seleccionar un repositorio."""
+        try:
+            print("\nObteniendo repositorios disponibles...")
+            repos = self.repo_manager.list_repositories(self.project_key)
+            
+            if not repos:
+                print("❌ No se encontraron repositorios disponibles en este proyecto.")
+                return False
+            
+            print("\nRepositorios disponibles:")
+            for i, repo in enumerate(repos):
+                print(f"{i+1}. {repo['name']} - {repo['description']}")
+            
+            while True:
+                try:
+                    repo_idx = int(input("\nSeleccione un repositorio (número): ")) - 1
+                    if 0 <= repo_idx < len(repos):
+                        self.repo_slug = repos[repo_idx]['slug']
+                        print(f"\n✅ Repositorio seleccionado: {repos[repo_idx]['name']}")
+                        return True
+                    else:
+                        print("❌ Índice de repositorio no válido, por favor intente de nuevo.")
+                except ValueError:
+                    print("❌ Por favor ingrese un número válido.")
+            
+        except Exception as e:
+            logger.error(f"Error al seleccionar repositorio: {e}")
+            print(f"\n❌ Error: {str(e)}")
+            return False
+    
+    async def _select_branch(self) -> bool:
+        """Guía al usuario para seleccionar una rama."""
+        try:
+            print("\nObteniendo ramas disponibles...")
+            branches = self.repo_manager.list_branches(self.project_key, self.repo_slug)
+            
+            if not branches:
+                print("⚠️ No se encontraron ramas específicas. Se intentará autodetectar la rama predeterminada.")
+                self.current_branch = self.repo_manager._get_default_branch(self.project_key, self.repo_slug)
+                print(f"Usando rama: {self.current_branch}")
+                return True
+            
+            print("\nRamas disponibles:")
+            default_branch_idx = 0
+            for i, branch in enumerate(branches):
+                is_default = branch.get("is_default", False)
+                if is_default:
+                    print(f"{i+1}. {branch['name']} (predeterminada)")
+                    default_branch_idx = i
+                else:
+                    print(f"{i+1}. {branch['name']}")
+            
+            use_specific_branch = input("\n¿Desea utilizar una rama específica? (s/n): ").lower() == "s"
+            
+            if use_specific_branch:
+                while True:
+                    try:
+                        branch_idx = int(input("Seleccione una rama (número): ")) - 1
+                        if 0 <= branch_idx < len(branches):
+                            self.current_branch = branches[branch_idx]["name"]
+                            print(f"\n✅ Rama seleccionada: {branches[branch_idx]['name']}")
+                            return True
+                        else:
+                            print("❌ Índice de rama no válido, por favor intente de nuevo.")
+                    except ValueError:
+                        print("❌ Por favor ingrese un número válido.")
+            else:
+                self.current_branch = branches[default_branch_idx]["name"] if branches else None
+                if self.current_branch:
+                    print(f"\n✅ Usando rama predeterminada: {self.current_branch}")
+                else:
+                    print("\n⚠️ No se pudo determinar la rama predeterminada.")
+                    self.current_branch = self.repo_manager._get_default_branch(self.project_key, self.repo_slug)
+                    print(f"Usando rama: {self.current_branch}")
+                return True
+            
+        except Exception as e:
+            logger.error(f"Error al seleccionar rama: {e}")
+            print(f"\n❌ Error: {str(e)}")
+            # Intentar obtener una rama por defecto
+            self.current_branch = self.repo_manager._get_default_branch(self.project_key, self.repo_slug)
+            print(f"Usando rama por defecto: {self.current_branch}")
+            return True
+    
+    async def _explore_repository(self):
+        """Explora el repositorio interactivamente."""
+        current_path = ""
+        breadcrumb = []
+        
+        # Intentar con cada rama disponible si la seleccionada falla
+        if self.current_branch:
+            print(f"\nVerificando acceso a la rama {self.current_branch}...")
+            # Probar la rama seleccionada
+            contents_test = self.repo_manager.get_folder_contents(
+                self.project_key, self.repo_slug, "", self.current_branch
+            )
+            
+            if not contents_test or all(item.get("suggested", False) for item in contents_test):
+                print(f"⚠️ No se pudo acceder a la rama {self.current_branch}.")
+                print("Intentando probar diferentes combinaciones de mayúsculas/minúsculas y ramas...")
+                
+                # Intentar con variantes de mayúsculas en el slug
+                slug_variants = [self.repo_slug, self.repo_slug.lower(), self.repo_slug.upper(), 
+                                self.repo_slug.capitalize(), self.repo_slug.title()]
+                
+                # Listar todas las ramas para probarlas
+                branches = self.repo_manager.list_branches(self.project_key, self.repo_slug)
+                branch_names = [branch["name"] for branch in branches] + ["main", "master", "develop", "trunk", "production"]
+                
+                # Intentar con todas las combinaciones
+                for slug in slug_variants:
+                    for branch_name in branch_names:
+                        if branch_name == self.current_branch and slug == self.repo_slug:
+                            continue  # Ya probamos esta combinación
+                            
+                        print(f"Probando: repositorio='{slug}', rama='{branch_name}'...")
+                        contents_test = self.repo_manager.get_folder_contents(
+                            self.project_key, slug, "", branch_name
+                        )
+                        
+                        # Verificar si obtuvimos contenido real (no sugerido)
+                        if contents_test and not all(item.get("suggested", False) for item in contents_test):
+                            print(f"✅ Combinación accesible: repo='{slug}', rama='{branch_name}'")
+                            self.repo_slug = slug
+                            self.current_branch = branch_name
+                            
+                            # Mostrar un mensaje de que hemos cambiado la configuración
+                            print("\n" + "=" * 60)
+                            print(f"⚠️ ATENCIÓN: Cambiado a repositorio='{slug}', rama='{branch_name}'")
+                            print("=" * 60)
+                            
+                            break
+                    
+                    # Si encontramos una combinación que funciona, salir del bucle exterior
+                    if contents_test and not all(item.get("suggested", False) for item in contents_test):
+                        break
+                
+                # Si aún no encontramos una combinación que funcione, avisar al usuario
+                if not contents_test or all(item.get("suggested", False) for item in contents_test):
+                    print("\n" + "=" * 60)
+                    print("⚠️ No se pudo acceder al contenido real del repositorio.")
+                    print("Se mostrarán carpetas sugeridas para exploración.")
+                    print("=" * 60)
+                    print("Posibles soluciones:")
+                    print("1. Verifica que el token de acceso tenga permisos suficientes")
+                    print("2. Confirma que el nombre del workspace, proyecto y repositorio son correctos")
+                    print("3. Asegúrate de que la rama existe y es accesible")
+                    print("4. Intenta con otro repositorio o workspace")
+                    print("=" * 60)
+        
+        while True:
+            try:
+                print("\n" + "=" * 60)
+                if breadcrumb:
+                    print(f"📂 Ruta actual: /{'/'.join(breadcrumb)}")
+                else:
+                    print("📂 Ruta actual: / (raíz)")
+                print("=" * 60)
+                print(f"🌿 Rama actual: {self.current_branch}")
+                print("=" * 60)
+                
+                # Obtener el contenido de la carpeta actual
+                contents = self.repo_manager.get_folder_contents(
+                    self.project_key, self.repo_slug, current_path, self.current_branch
+                )
+                
+                if not contents:
+                    print("Esta carpeta está vacía o no se pudo acceder a su contenido.")
+                    # Preguntar si desea descargar esta carpeta de todos modos
+                    download_empty = input("\n¿Desea descargar esta carpeta vacía? (s/n): ").lower() == "s"
+                    if download_empty:
+                        download_path = OUTPUT_DIR / f"{self.repo_slug}_{current_path.replace('/', '_')}"
+                        download_path.mkdir(parents=True, exist_ok=True)
+                        print(f"\n✅ Carpeta vacía creada en: {download_path}")
+                    
+                    # Preguntar si quiere volver atrás
+                    go_back = input("\n¿Desea volver a la carpeta anterior? (s/n): ").lower() == "s"
+                    if go_back and breadcrumb:
+                        breadcrumb.pop()
+                        current_path = "/".join(breadcrumb)
+                    else:
+                        break
+                    continue
+                
+                # Separar directorios y archivos
+                directories = [item for item in contents if item["type"] == "directory"]
+                files = [item for item in contents if item["type"] == "file"]
+                
+                # Mostrar directorios
+                print("\nCarpetas:")
+                if directories:
+                    for i, directory in enumerate(directories):
+                        print(f"{i+1}. 📁 {directory['name']}")
+                else:
+                    print("(No hay carpetas)")
+                
+                # Mostrar archivos
+                print("\nArchivos:")
+                if files:
+                    for i, file in enumerate(files):
+                        size = file.get("size", 0)
+                        size_str = f"({size / 1024:.1f} KB)" if size else ""
+                        
+                        # Verificar si es un archivo de información especial
+                        if file.get("suggested", False) and file.get("info"):
+                            print(f"{i+1}. ℹ️ {file['name']} - {file.get('info')}")
+                            if 'content' in file:
+                                print(f"   {file['content']}")
+                        else:
+                            print(f"{i+1}. 📄 {file['name']} {size_str}")
+                else:
+                    print("(No hay archivos)")
+                
+                # Opciones
+                print("\nOpciones:")
+                print("1. Entrar en una carpeta")
+                print("2. Descargar esta carpeta")
+                print("3. Buscar archivos de código en este repositorio")
+                print("4. Volver a la carpeta anterior")
+                print("5. Cambiar de rama")
+                print("6. Salir")
+                
+                option = input("\nSeleccione una opción: ")
+                
+                if option == "1":
+                    # Entrar en una carpeta
+                    if not directories:
+                        print("❌ No hay carpetas para explorar.")
+                        continue
+                    
+                    dir_idx = int(input(f"Seleccione una carpeta (1-{len(directories)}): ")) - 1
+                    if 0 <= dir_idx < len(directories):
+                        selected_dir = directories[dir_idx]
+                        breadcrumb.append(selected_dir["name"])
+                        current_path = selected_dir["path"]
+                        print(f"\n👉 Entrando en: {selected_dir['name']}")
+                    else:
+                        print("❌ Índice de carpeta no válido.")
+                
+                elif option == "2":
+                    # Descargar esta carpeta
+                    print(f"\nDescargando contenido de: {'/' + current_path if current_path else 'raíz'}")
+                    
+                    download_path = self.repo_manager.download_folder(
+                        self.project_key, self.repo_slug, current_path, 
+                        OUTPUT_DIR, self.current_branch
+                    )
+                    
+                    print(f"\n✅ Contenido descargado en: {download_path}")
+                    
+                    continue_exploring = input("\n¿Desea continuar explorando el repositorio? (s/n): ").lower() == "s"
+                    if not continue_exploring:
+                        break
+                
+                elif option == "3":
+                    # Buscar archivos de código en este repositorio
+                    await self._search_code_files(current_path)
+                
+                elif option == "4":
+                    # Volver atrás
+                    if breadcrumb:
+                        breadcrumb.pop()
+                        current_path = "/".join(breadcrumb)
+                        print("\n👈 Volviendo a la carpeta anterior...")
+                    else:
+                        print("❌ Ya está en la raíz del repositorio.")
+                
+                elif option == "5":
+                    # Cambiar de rama
+                    branches = self.repo_manager.list_branches(self.project_key, self.repo_slug)
+                    
+                    print("\nRamas disponibles:")
+                    for i, branch in enumerate(branches):
+                        is_current = branch["name"] == self.current_branch
+                        if is_current:
+                            print(f"{i+1}. {branch['name']} (actual)")
+                        else:
+                            print(f"{i+1}. {branch['name']}")
+                    
+                    branch_idx = int(input("\nSeleccione una rama (número): ")) - 1
+                    if 0 <= branch_idx < len(branches):
+                        self.current_branch = branches[branch_idx]["name"]
+                        print(f"\n✅ Rama cambiada a: {branches[branch_idx]['name']}")
+                    else:
+                        print("❌ Índice de rama no válido.")
+                
+                elif option == "6":
+                    # Salir
+                    break
+                
+                else:
+                    print("❌ Opción no válida.")
+                
+            except Exception as e:
+                logger.error(f"Error durante la exploración: {e}")
+                print(f"\n❌ Error: {str(e)}")
+                
+                # Preguntar si quiere intentar continuar o salir
+                retry = input("\n¿Desea intentar continuar? (s/n): ").lower() == "s"
+                if not retry:
+                    break
+        
+        print("\n¡Gracias por usar el Explorador de Repositorios!")
+    
+    async def _search_code_files(self, current_path: str = ""):
+        """Busca archivos de código en el repositorio y ofrece descargarlos."""
+        print("\n" + "=" * 60)
+        print("🔎 BUSCANDO ARCHIVOS DE CÓDIGO")
+        print("=" * 60)
+        
+        print("Buscando archivos en todo el repositorio. Esto puede tardar un momento...")
+        
+        # Lista de extensiones de archivos de código comunes
+        code_extensions = [
+            ".py", ".java", ".js", ".ts", ".html", ".css", ".scss", 
+            ".jsx", ".tsx", ".php", ".rb", ".c", ".cpp", ".h", ".cs",
+            ".go", ".rs", ".swift", ".kt", ".scala", ".vb", ".sh",
+            ".ipynb", ".sql", ".xml", ".json", ".yaml", ".yml", ".md",
+            ".docx", ".xlsx", ".pptx", ".pdf", ".txt"
+        ]
+        
+        # Buscar para cada extensión
+        all_files = []
+        
+        # Método 1: Buscar usando la API de contenido
+        for ext in code_extensions:
+            try:
+                # Intentamos obtener todos los archivos con esta extensión
+                if self.repo_manager.repo_type == "bitbucket":
+                    workspace = self.repo_manager.credentials["workspace"]
+                    
+                    # Construir URL base para búsqueda
+                    search_url = f"{self.repo_manager.base_url}/repositories/{workspace}/{self.repo_slug}/src/{self.current_branch}"
+                    
+                    # Intentar usar la API de búsqueda si está disponible
+                    try:
+                        params = {"q": f"path:*{ext}"}
+                        response = self.repo_manager.session.get(search_url, params=params)
+                        
+                        if response.status_code == 200:
+                            data = response.json()
+                            
+                            for item in data.get("values", []):
+                                if item.get("type") != "commit_directory" and item.get("path", "").lower().endswith(ext):
+                                    all_files.append({
+                                        "name": item.get("path", "").split("/")[-1],
+                                        "path": item.get("path", ""),
+                                        "type": "file",
+                                        "size": item.get("size", 0)
+                                    })
+                    except Exception as search_e:
+                        print(f"Error en búsqueda de archivos {ext}: {search_e}")
+                        
+                    # Si tenemos muy pocos resultados, intentar usar un método alternativo
+                    if len(all_files) < 3:
+                        # Método alternativo: obtener toda la estructura y filtrar por extensión
+                        try:
+                            # Intentar usar el visor de código de Bitbucket
+                            browse_url = f"https://bitbucket.org/{workspace}/{self.repo_slug}/src/{self.current_branch}/"
+                            headers = {
+                                "Accept": "text/html,application/xhtml+xml,application/xml",
+                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                            }
+                            
+                            browse_session = requests.Session()
+                            browse_session.auth = self.repo_manager.session.auth
+                            
+                            browse_response = browse_session.get(browse_url, headers=headers)
+                            
+                            if browse_response.status_code == 200:
+                                html_content = browse_response.text
+                                
+                                # Buscar enlaces a archivos con esta extensión
+                                import re
+                                pattern = f'href="[^"]*?/src/[^"]*?/([^"]*?{ext})"'
+                                file_matches = re.findall(pattern, html_content)
+                                
+                                for file_path in file_matches:
+                                    # Evitar duplicados
+                                    if not any(item["path"] == file_path for item in all_files):
+                                        all_files.append({
+                                            "name": file_path.split("/")[-1],
+                                            "path": file_path,
+                                            "type": "file",
+                                            "size": 0
+                                        })
+                        except Exception as browse_e:
+                            print(f"Error en búsqueda alternativa: {browse_e}")
+                
+                # Método similar para GitHub
+                elif self.repo_manager.repo_type == "github":
+                    # Implementar búsqueda similar para GitHub
+                    pass
+                    
+            except Exception as e:
+                print(f"Error buscando archivos {ext}: {e}")
+        
+        # Mostrar resultados
+        if all_files:
+            print(f"\nSe encontraron {len(all_files)} archivos de código:")
+            
+            # Agrupar por extensión para una visualización más clara
+            files_by_ext = {}
+            for file in all_files:
+                ext = "." + file["name"].split(".")[-1] if "." in file["name"] else "sin extensión"
+                if ext not in files_by_ext:
+                    files_by_ext[ext] = []
+                files_by_ext[ext].append(file)
+            
+            # Mostrar resumen por tipo de archivo
+            print("\nResumen por tipo de archivo:")
+            for ext, files in files_by_ext.items():
+                print(f"{ext}: {len(files)} archivos")
+            
+            # Mostrar lista completa
+            print("\nLista de archivos encontrados:")
+            for i, file in enumerate(all_files):
+                print(f"{i+1}. {file['path']}")
+            
+            # Preguntar si desea descargar todos los archivos
+            download_all = input("\n¿Desea descargar todos estos archivos? (s/n): ").lower() == "s"
+            
+            if download_all:
+                # Crear directorio para la descarga
+                download_dir = OUTPUT_DIR / f"{self.repo_slug}_archivos_codigo"
+                download_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Descargar cada archivo
+                print(f"\nDescargando {len(all_files)} archivos...")
+                downloaded = 0
+                
+                for file in all_files:
+                    try:
+                        # Determinar la ruta del archivo
+                        file_path = file["path"]
+                        
+                        # Crear estructura de carpetas si es necesario
+                        file_parts = file_path.split("/")
+                        if len(file_parts) > 1:
+                            subdir_path = download_dir / "/".join(file_parts[:-1])
+                            subdir_path.mkdir(parents=True, exist_ok=True)
+                        
+                        # Descargar el archivo
+                        try:
+                            self.repo_manager._download_file(
+                                self.project_key, self.repo_slug, file_path, 
+                                download_dir, self.current_branch
+                            )
+                            downloaded += 1
+                        except Exception as download_e:
+                            print(f"Error descargando {file_path}: {download_e}")
+                    except Exception as e:
+                        print(f"Error procesando {file['path']}: {e}")
+                
+                print(f"\n✅ Se descargaron {downloaded} de {len(all_files)} archivos en: {download_dir}")
+            
+            # Preguntar si desea seleccionar archivos específicos
+            else:
+                select_files = input("\n¿Desea seleccionar archivos específicos para descargar? (s/n): ").lower() == "s"
+                
+                if select_files:
+                    # Permitir seleccionar archivos específicos
+                    indices = input("\nIngrese los números de los archivos separados por comas (ejemplo: 1,3,5): ")
+                    try:
+                        selected_indices = [int(idx.strip()) - 1 for idx in indices.split(",")]
+                        selected_files = [all_files[idx] for idx in selected_indices if 0 <= idx < len(all_files)]
+                        
+                        if selected_files:
+                            # Crear directorio para la descarga
+                            download_dir = OUTPUT_DIR / f"{self.repo_slug}_archivos_seleccionados"
+                            download_dir.mkdir(parents=True, exist_ok=True)
+                            
+                            # Descargar cada archivo seleccionado
+                            print(f"\nDescargando {len(selected_files)} archivos seleccionados...")
+                            downloaded = 0
+                            
+                            for file in selected_files:
+                                try:
+                                    # Descargar el archivo
+                                    self.repo_manager._download_file(
+                                        self.project_key, self.repo_slug, file["path"], 
+                                        download_dir, self.current_branch
+                                    )
+                                    downloaded += 1
+                                except Exception as download_e:
+                                    print(f"Error descargando {file['path']}: {download_e}")
+                            
+                            print(f"\n✅ Se descargaron {downloaded} archivos seleccionados en: {download_dir}")
+                        else:
+                            print("\n❌ No se seleccionaron archivos válidos.")
+                    except Exception as e:
+                        print(f"\n❌ Error en la selección de archivos: {e}")
+        else:
+            print("\nNo se encontraron archivos de código en este repositorio.")
+            
+            # Intentar método alternativo
+            try:
+                print("\nIntentando método alternativo para encontrar archivos...")
+                
+                # Probar explorando manualmente algunas rutas comunes
+                common_paths = ["src", "lib", "app", "main", "docs", "tests", "IA", "proyectos", 
+                               "innovacion", "BI", "rag_sescol", "seleccion_personal"]
+                
+                found_files = []
+                
+                for path in common_paths:
+                    try:
+                        contents = self.repo_manager.get_folder_contents(
+                            self.project_key, self.repo_slug, path, self.current_branch
+                        )
+                        
+                        if contents and not all(item.get("suggested", False) for item in contents):
+                            # Filtrar solo archivos
+                            path_files = [item for item in contents if item["type"] == "file"]
+                            
+                            if path_files:
+                                print(f"Encontrados {len(path_files)} archivos en la ruta '{path}'")
+                                found_files.extend(path_files)
+                                
+                                # También explorar un nivel más profundo si hay directorios
+                                dirs = [item for item in contents if item["type"] == "directory"]
+                                
+                                for dir_item in dirs:
+                                    try:
+                                        subdir_path = dir_item["path"]
+                                        subdir_contents = self.repo_manager.get_folder_contents(
+                                            self.project_key, self.repo_slug, subdir_path, self.current_branch
+                                        )
+                                        
+                                        if subdir_contents:
+                                            subdir_files = [item for item in subdir_contents if item["type"] == "file"]
+                                            
+                                            if subdir_files:
+                                                print(f"Encontrados {len(subdir_files)} archivos en '{subdir_path}'")
+                                                found_files.extend(subdir_files)
+                                    except:
+                                        pass
+                    except:
+                        pass
+                
+                if found_files:
+                    print(f"\nSe encontraron {len(found_files)} archivos en rutas comunes:")
+                    
+                    for i, file in enumerate(found_files):
+                        print(f"{i+1}. {file['path']}")
+                    
+                    # Ofrecer descargar estos archivos
+                    download_all = input("\n¿Desea descargar todos estos archivos? (s/n): ").lower() == "s"
+                    
+                    if download_all:
+                        # Crear directorio para la descarga
+                        download_dir = OUTPUT_DIR / f"{self.repo_slug}_archivos_encontrados"
+                        download_dir.mkdir(parents=True, exist_ok=True)
+                        
+                        # Descargar cada archivo
+                        print(f"\nDescargando {len(found_files)} archivos...")
+                        downloaded = 0
+                        
+                        for file in found_files:
+                            try:
+                                self.repo_manager._download_file(
+                                    self.project_key, self.repo_slug, file["path"], 
+                                    download_dir, self.current_branch
+                                )
+                                downloaded += 1
+                            except Exception as download_e:
+                                print(f"Error descargando {file['path']}: {download_e}")
+                        
+                        print(f"\n✅ Se descargaron {downloaded} archivos en: {download_dir}")
+                else:
+                    print("\nNo se encontraron archivos en rutas comunes.")
+            except Exception as alt_e:
+                print(f"Error en búsqueda alternativa: {alt_e}")
+        
+        input("\nPresione Enter para continuar...")
+
+
+async def main():
+    """Función principal."""
+    try:
+        explorer = RepositoryExplorer()
+        await explorer.run()
+    except KeyboardInterrupt:
+        print("\n\nOperación cancelada por el usuario.")
+        sys.exit(0)
+    except Exception as e:
+        logger.error(f"Error inesperado: {e}")
+        print(f"\n❌ Error inesperado: {str(e)}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    # Ejecutar la función principal con asyncio
+    asyncio.run(main())
